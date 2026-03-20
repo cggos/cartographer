@@ -1,4 +1,17 @@
 /*
+ * 体素滤波器 (Voxel Filter)
+ * 
+ * 功能：对点云进行降采样，减少计算量同时保留关键特征
+ * 
+ * 滤波器类型：
+ * 1. VoxelFilter: 固定分辨率体素滤波
+ * 2. AdaptiveVoxelFilter: 自适应体素滤波
+ * 
+ * 原理：
+ * - 将点云划分为三维体素网格
+ * - 每个体素只保留一个代表性点
+ * - 使用随机采样保证均匀性
+ * 
  * Copyright 2016 The Cartographer Authors
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -28,13 +41,40 @@ namespace sensor {
 
 namespace {
 
+/**
+ * @brief 按最大距离过滤点云
+ * 
+ * @param point_cloud 输入点云
+ * @param max_range 最大有效距离
+ * @return PointCloud 过滤后的点云
+ */
 PointCloud FilterByMaxRange(const PointCloud& point_cloud,
                             const float max_range) {
   return point_cloud.copy_if([max_range](const RangefinderPoint& point) {
-    return point.position.norm() <= max_range;
+    return point.position.norm() <= max_range;  // 只保留距离原点<=max_range的点
   });
 }
 
+/**
+ * @brief 自适应体素滤波
+ * 
+ * 功能：根据点云密度自适应调整体素大小，保证滤波后点云密度
+ * 
+ * 算法步骤：
+ * 1. 如果点云已经很稀疏（<=min_num_points），直接返回
+ * 2. 用 max_length 进行体素滤波
+ * 3. 如果结果点数>=min_num_points，返回结果
+ * 4. 否则二分搜索找到合适的体素大小
+ * 
+ * 参数说明：
+ * - max_length: 最大体素边长
+ * - min_num_points: 每个体素最少保留点数
+ * - max_range: 最大有效距离
+ * 
+ * @param options 自适应滤波选项
+ * @param point_cloud 输入点云
+ * @return PointCloud 滤波后的点云
+ */
 PointCloud AdaptivelyVoxelFiltered(
     const proto::AdaptiveVoxelFilterOptions& options,
     const PointCloud& point_cloud) {
@@ -131,6 +171,20 @@ std::vector<T> RandomizedVoxelFilter(const std::vector<T>& point_cloud,
 
 }  // namespace
 
+/**
+ * @brief 固定分辨率体素滤波
+ * 
+ * 功能：将点云划分为固定大小的体素网格，每个体素只保留一个点
+ * 
+ * 算法原理：
+ * 1. 将点云按体素分辨率划分为网格
+ * 2. 每个体素格子内只随机保留一个点
+ * 3. 减少点云密度，保留空间分布特征
+ * 
+ * @param points 输入点云
+ * @param resolution 体素分辨率（边长）
+ * @return std::vector<RangefinderPoint> 滤波后的点云
+ */
 std::vector<RangefinderPoint> VoxelFilter(
     const std::vector<RangefinderPoint>& points, const float resolution) {
   return RandomizedVoxelFilter(
@@ -138,17 +192,26 @@ std::vector<RangefinderPoint> VoxelFilter(
       [](const RangefinderPoint& point) { return point.position; });
 }
 
+/**
+ * @brief 带强度的点云体素滤波
+ * 
+ * @param point_cloud 输入点云（包含强度信息）
+ * @param resolution 体素分辨率
+ * @return PointCloud 滤波后的点云
+ */
 PointCloud VoxelFilter(const PointCloud& point_cloud, const float resolution) {
   const std::vector<bool> points_used = RandomizedVoxelFilterIndices(
       point_cloud.points(), resolution,
       [](const RangefinderPoint& point) { return point.position; });
 
+  // 收集保留下来的点
   std::vector<RangefinderPoint> filtered_points;
   for (size_t i = 0; i < point_cloud.size(); i++) {
     if (points_used[i]) {
       filtered_points.push_back(point_cloud[i]);
     }
   }
+  // 收集对应的强度值
   std::vector<float> filtered_intensities;
   CHECK_LE(point_cloud.intensities().size(), point_cloud.points().size());
   for (size_t i = 0; i < point_cloud.intensities().size(); i++) {

@@ -1,4 +1,18 @@
 /*
+ * 平移增量成本函数 (Translation Delta Cost Functor)
+ * 
+ * 功能：惩罚当前平移与目标平移之间的偏差
+ * 
+ * 算法原理：
+ * residual = scaling_factor * (translation - target_translation)
+ * 
+ * 目的：
+ * - 作为正则化项，防止位姿偏离预测值太远
+ * - 保持SLAM的连续性和稳定性
+ * 
+ * 残差维度：3 (x, y, z三个方向)
+ * 优化变量维度：3 (平移分量)
+ * 
  * Copyright 2016 The Cartographer Authors
  *
  * Licensed under the Apache License, Version 2.0 (the "License");

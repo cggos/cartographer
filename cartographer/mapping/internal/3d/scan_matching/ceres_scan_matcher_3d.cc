@@ -1,4 +1,20 @@
 /*
+ * Ceres 3D扫描匹配器
+ * 
+ * 功能：使用Ceres非线性优化进行精确的激光点云匹配
+ * 
+ * 算法原理：
+ * 将扫描匹配问题转化为非线性最小二乘优化问题
+ * 最小化成本函数找到最优机器人位姿
+ * 
+ * 成本函数组成：
+ * 1. OccupiedSpaceCostFunction: 点云与子图栅格匹配成本
+ * 2. IntensityCostFunction: 强度匹配成本(可选)
+ * 3. TranslationDeltaCostFunctor: 平移约束成本
+ * 4. RotationDeltaCostFunctor: 旋转约束成本
+ * 
+ * 优化变量：6维 (x,y,z, qx,qy,qz,qw)
+ * 
  * Copyright 2016 The Cartographer Authors
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -87,6 +103,38 @@ CeresScanMatcher3D::CeresScanMatcher3D(
   ceres_solver_options_.linear_solver_type = ceres::DENSE_QR;
 }
 
+/**
+ * @brief Ceres扫描匹配 - 非线性优化求解最优位姿
+ * 
+ * 功能：将激光点云与子图进行匹配，通过最小化成本函数找到最优机器人位姿
+ * 
+ * 优化问题形式：
+ * min ||cost_function(pose)||^2
+ * 
+ * 成本函数组成：
+ * 1. OccupiedSpaceCostFunction: 点云占据空间成本（核心）
+ *    - 将点云通过当前位姿变换到世界坐标
+ *    - 查询子图HybridGrid中的占据概率
+ *    - 成本 = 1 - probability (概率越高，成本越低)
+ * 
+ * 2. IntensityCostFunction: 强度匹配成本（可选）
+ *    - 利用激光回波强度进行匹配
+ *    - 使用Huber Loss减少异常值影响
+ * 
+ * 3. TranslationDeltaCostFunctor: 平移约束
+ *    - 惩罚与目标平移的偏差
+ *    - 防止位姿偏离预测太远
+ * 
+ * 4. RotationDeltaCostFunctor: 旋转约束
+ *    - 惩罚与初始旋转的偏差
+ *    - 保持位姿连续性
+ * 
+ * @param target_translation 目标平移（来自预测）
+ * @param initial_pose_estimate 初始位姿估计（来自相关扫描匹配）
+ * @param point_clouds_and_hybrid_grids 点云与子图栅格对（高/低分辨率）
+ * @param pose_estimate 输出：优化后的位姿估计
+ * @param summary 输出：优化结果摘要
+ */
 void CeresScanMatcher3D::Match(
     const Eigen::Vector3d& target_translation,
     const transform::Rigid3d& initial_pose_estimate,

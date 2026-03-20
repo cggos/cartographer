@@ -1,4 +1,17 @@
 /*
+ * RangeDataInserter3D - 3D点云数据插入器
+ * 
+ * 功能：将激光点云数据插入到HybridGrid栅格地图中
+ * 
+ * 插入算法：
+ * 1. 对命中点（hits）：增加栅格占据概率
+ * 2. 对未命中点（misses）：减少栅格占据概率
+ * 3. 对强度信息：更新强度栅格
+ * 
+ * 占据更新公式（贝叶斯更新）：
+ * odds(p) = p / (1 - p)
+ * p' = odds^-1(odds(p) × odds(hit_probability))
+ * 
  * Copyright 2016 The Cartographer Authors
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -92,24 +105,53 @@ RangeDataInserter3D::RangeDataInserter3D(
       miss_table_(
           ComputeLookupTableToApplyOdds(Odds(options_.miss_probability()))) {}
 
+/**
+ * @brief 将点云数据插入栅格地图
+ * 
+ * 功能：更新HybridGrid的占据概率
+ * 
+ * 处理步骤：
+ * 1. 对每个命中点：增加占据概率
+ * 2. 对命中点之间的射线：减少空闲概率
+ * 3. 更新强度栅格
+ * 4. 完成本次更新
+ * 
+ * 占据概率更新：
+ * - hit: p_new = p_old × hit_probability
+ * - miss: p_new = p_old × miss_probability
+ * 
+ * @param range_data 点云数据（returns: 命中点, origin: 起点）
+ * @param hybrid_grid 目标栅格地图
+ * @param intensity_hybrid_grid 强度栅格（可选）
+ */
 void RangeDataInserter3D::Insert(
     const sensor::RangeData& range_data, HybridGrid* hybrid_grid,
     IntensityHybridGrid* intensity_hybrid_grid) const {
   CHECK_NOTNULL(hybrid_grid);
 
+  // ========== 步骤1: 插入命中点 ==========
+  // 对每个命中点，增加其栅格单元的占据概率
   for (const sensor::RangefinderPoint& hit : range_data.returns) {
     const Eigen::Array3i hit_cell = hybrid_grid->GetCellIndex(hit.position);
     hybrid_grid->ApplyLookupTable(hit_cell, hit_table_);
   }
 
+  // ========== 步骤2: 插入空闲空间（misses） ==========
+  // 对传感器起点到命中点之间的射线上的栅格
+  // 减少其占据概率（表示这是空闲空间）
   // By not starting a new update after hits are inserted, we give hits priority
   // (i.e. no hits will be ignored because of a miss in the same cell).
   InsertMissesIntoGrid(miss_table_, range_data.origin, range_data.returns,
                        hybrid_grid, options_.num_free_space_voxels());
+                       
+  // ========== 步骤3: 插入强度数据 ==========
   if (intensity_hybrid_grid != nullptr) {
     InsertIntensitiesIntoGrid(range_data.returns, intensity_hybrid_grid,
                               options_.intensity_threshold());
   }
+  
+  // ========== 步骤4: 完成更新 ==========
+  // 标记更新完成，允许后续新的更新
   hybrid_grid->FinishUpdate();
 }
 

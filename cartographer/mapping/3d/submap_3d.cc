@@ -1,4 +1,17 @@
 /*
+ * Submap3D - 3D子图实现
+ * 
+ * 功能：管理3D子图，包含高/低分辨率HybridGrid
+ * 
+ * 子图结构：
+ * - high_resolution_hybrid_grid_: 高分辨率栅格（精细建图）
+ * - low_resolution_hybrid_grid_: 低分辨率栅格（快速匹配）
+ * - rotational_scan_matcher_histogram_: 旋转直方图
+ * 
+ * 子图生命周期：
+ * 1. 活跃状态：接受新的range data插入
+ * 2. 完成状态：不再接受新数据，用于闭环检测
+ * 
  * Copyright 2016 The Cartographer Authors
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -268,26 +281,54 @@ void Submap3D::ToResponseProto(
                     response->add_textures());
 }
 
+/**
+ * @brief 将点云数据插入子图
+ * 
+ * 功能：将经过运动补偿的点云插入到子图的栅格中
+ * 
+ * 处理步骤：
+ * 1. 将点云转换到子图坐标系
+ * 2. 按最大距离过滤点云
+ * 3. 插入高分辨率栅格
+ * 4. 插入低分辨率栅格
+ * 5. 更新旋转直方图
+ * 
+ * @param range_data_in_local local坐标系下的点云
+ * @param range_data_inserter 栅格插入器
+ * @param high_resolution_max_range 高分辨率栅格最大距离
+ * @param local_from_gravity_aligned 重力对齐旋转
+ * @param scan_histogram_in_gravity 当前扫描的直方图
+ */
 void Submap3D::InsertData(const sensor::RangeData& range_data_in_local,
-                          const RangeDataInserter3D& range_data_inserter,
-                          const float high_resolution_max_range,
-                          const Eigen::Quaterniond& local_from_gravity_aligned,
-                          const Eigen::VectorXf& scan_histogram_in_gravity) {
+                        const RangeDataInserter3D& range_data_inserter,
+                        const float high_resolution_max_range,
+                        const Eigen::Quaterniond& local_from_gravity_aligned,
+                        const Eigen::VectorXf& scan_histogram_in_gravity) {
   CHECK(!insertion_finished());
-  // Transform range data into submap frame.
+  
+  // ========== 步骤1: 转换到子图坐标系 ==========
+  // 将点云从local frame转换到submap frame
   const sensor::RangeData transformed_range_data = sensor::TransformRangeData(
       range_data_in_local, local_pose().inverse().cast<float>());
+      
+  // ========== 步骤2: 插入高分辨率栅格 ==========
   range_data_inserter.Insert(
       FilterRangeDataByMaxRange(transformed_range_data,
                                 high_resolution_max_range),
       high_resolution_hybrid_grid_.get(),
       high_resolution_intensity_hybrid_grid_.get());
+      
+  // ========== 步骤3: 插入低分辨率栅格 ==========
   range_data_inserter.Insert(transformed_range_data,
-                             low_resolution_hybrid_grid_.get(),
-                             /*intensity_hybrid_grid=*/nullptr);
+                            low_resolution_hybrid_grid_.get(),
+                            /*intensity_hybrid_grid=*/nullptr);
+                            
+  // ========== 步骤4: 更新计数和直方图 ==========
   set_num_range_data(num_range_data() + 1);
+  // 计算子图中yaw角度
   const float yaw_in_submap_from_gravity = transform::GetYaw(
       local_pose().inverse().rotation() * local_from_gravity_aligned);
+  // 更新旋转直方图（累积历史直方图）
   rotational_scan_matcher_histogram_ +=
       scan_matching::RotationalScanMatcher::RotateHistogram(
           scan_histogram_in_gravity, yaw_in_submap_from_gravity);
@@ -307,22 +348,44 @@ std::vector<std::shared_ptr<const Submap3D>> ActiveSubmaps3D::submaps() const {
                                                       submaps_.end());
 }
 
+/**
+ * @brief 活跃子图管理器插入数据
+ * 
+ * 功能：管理多个活跃子图，将点云数据插入所有活跃子图
+ * 
+ * 子图管理策略：
+ * - 维护2个子图：一个用于匹配，一个用于构建
+ * - 当当前子图累积足够数据后，创建新子图
+ * - 当最老子图数据量达到2倍时，标记为完成
+ * 
+ * @param range_data 点云数据
+ * @param local_from_gravity_aligned 重力对齐旋转
+ * @param rotational_scan_matcher_histogram_in_gravity 旋转直方图
+ * @return std::vector<std::shared_ptr<const Submap3D>> 所有活跃子图列表
+ */
 std::vector<std::shared_ptr<const Submap3D>> ActiveSubmaps3D::InsertData(
     const sensor::RangeData& range_data,
     const Eigen::Quaterniond& local_from_gravity_aligned,
     const Eigen::VectorXf& rotational_scan_matcher_histogram_in_gravity) {
+  // ========== 步骤1: 检查是否需要创建新子图 ==========
+  // 条件：没有子图 或 当前子图已满
   if (submaps_.empty() ||
       submaps_.back()->num_range_data() == options_.num_range_data()) {
     AddSubmap(transform::Rigid3d(range_data.origin.cast<double>(),
                                  local_from_gravity_aligned),
               rotational_scan_matcher_histogram_in_gravity.size());
   }
+  
+  // ========== 步骤2: 插入数据到所有活跃子图 ==========
   for (auto& submap : submaps_) {
     submap->InsertData(range_data, range_data_inserter_,
                        options_.high_resolution_max_range(),
                        local_from_gravity_aligned,
                        rotational_scan_matcher_histogram_in_gravity);
   }
+  
+  // ========== 步骤3: 检查是否需要完成最老子图 ==========
+  // 当最老子图数据量达到2倍时，标记为完成
   if (submaps_.front()->num_range_data() == 2 * options_.num_range_data()) {
     submaps_.front()->Finish();
   }

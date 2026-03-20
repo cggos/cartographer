@@ -1,4 +1,18 @@
 /*
+ * RotationalScanMatcher - 旋转扫描匹配器
+ * 
+ * 功能：根据点云的旋转直方图进行旋转匹配
+ * 
+ * 算法原理：
+ * 1. 将点云按高度分层（slice）
+ * 2. 每层计算点到质心的角度分布直方图
+ * 3. 匹配不同扫描的角度直方图，估计相对旋转
+ * 
+ * 应用场景：
+ * - 3D SLAM中用于估计scan-to-scan的旋转
+ * - 闭环检测时的粗旋转估计
+ * - 减少后续精细匹配的搜索空间
+ * 
  * Copyright 2016 The Cartographer Authors
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -161,15 +175,43 @@ Eigen::VectorXf RotationalScanMatcher::RotateHistogram(
          (1.f - fraction) * rotated_histogram_0;
 }
 
+/**
+ * @brief 计算点云的旋转直方图
+ * 
+ * 功能：将点云转换为旋转角度直方图，用于旋转匹配
+ * 
+ * 算法流程：
+ * 1. 按高度将点云分成多个slice（层）
+ * 2. 对每个slice：
+ *    - 按角度排序点
+ *    - 计算相邻点的角度
+ *    - 将角度添加到直方图
+ * 3. 合并所有slice的直方图
+ * 
+ * 直方图含义：
+ * - 横轴：角度 [0, π)
+ * - 纵轴：权重（根据点间距计算）
+ * - 作用：描述点云的水平旋转特征
+ * 
+ * @param point_cloud 输入点云
+ * @param histogram_size 直方图桶的数量
+ * @return Eigen::VectorXf 旋转直方图
+ */
 Eigen::VectorXf RotationalScanMatcher::ComputeHistogram(
     const sensor::PointCloud& point_cloud, const int histogram_size) {
   Eigen::VectorXf histogram = Eigen::VectorXf::Zero(histogram_size);
+  
+  // ========== 步骤1: 按高度分层 ==========
+  // 每隔 kSliceHeight (0.2m) 分一层
   std::map<int, sensor::PointCloud> slices;
   for (const sensor::RangefinderPoint& point : point_cloud) {
     slices[common::RoundToInt(point.position.z() / kSliceHeight)].push_back(
         point);
   }
+  
+  // ========== 步骤2: 对每层计算直方图 ==========
   for (const auto& slice : slices) {
+    // 对每层的点按角度排序，然后添加到直方图
     AddPointCloudSliceToHistogram(SortSlice(slice.second), &histogram);
   }
   return histogram;

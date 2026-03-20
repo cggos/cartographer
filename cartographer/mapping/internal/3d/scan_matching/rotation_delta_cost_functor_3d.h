@@ -1,4 +1,24 @@
 /*
+ * 旋转增量成本函数 (Rotation Delta Cost Functor)
+ * 
+ * 功能：惩罚当前旋转与目标旋转之间的偏差
+ * 
+ * 算法原理：
+ * 1. 计算四元数乘积：delta = target_rotation_inverse * current_rotation
+ *    - delta表示从目标旋转到当前旋转的增量
+ * 2. 从delta四元数中提取旋转轴角表示
+ *    - delta = [cos(θ/2), sin(θ/2)*axis_x, sin(θ/2)*axis_y, sin(θ/2)*axis_z]
+ *    - 虚部 (sin(θ/2)*axis) 就是残差
+ * 3. 残差 = scaling_factor * [qx, qy, qz]
+ *    - 这相当于 sin(θ/2) ≈ θ/2 (小角近似)
+ * 
+ * 目的：
+ * - 作为正则化项，防止旋转偏离预测值太远
+ * - 保持SLAM的连续性和稳定性
+ * 
+ * 残差维度：3 (旋转轴的三个分量)
+ * 优化变量维度：4 (四元数)
+ * 
  * Copyright 2016 The Cartographer Authors
  *
  * Licensed under the Apache License, Version 2.0 (the "License");

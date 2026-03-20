@@ -1,4 +1,22 @@
 /*
+ * 占据空间成本函数 (Occupied Space Cost Function)
+ * 
+ * 功能：计算点云与子图栅格之间的匹配成本
+ * 
+ * 算法原理：
+ * 1. 将点云通过当前位姿(transform)变换到世界坐标系
+ * 2. 在HybridGrid中进行三维插值，获取占据概率
+ * 3. 成本 = scaling_factor * (1 - probability)
+ *    - probability越高（越可能占据），成本越低
+ *    - probability越低（越空闲），成本越高
+ * 
+ * 优化目标：让更多点落在高概率区域
+ * 
+ * 模板参数：
+ * - T: 自动微分类型 (double或ceres::Jet)
+ * - 3: 平移变量个数 (x, y, z)
+ * - 4: 旋转变量个数 (qx, qy, qz, qw) 四元数
+ * 
  * Copyright 2016 The Cartographer Authors
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
