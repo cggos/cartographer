@@ -27,12 +27,11 @@
 namespace cartographer {
 namespace mapping {
 
-// A class that tracks the connectivity structure between trajectories.
+// 跟踪轨迹之间连通结构的类。
 //
-// Connectivity includes both the count ("How many times have I _directly_
-// connected trajectories i and j?") and the transitive connectivity.
+// 连通性包括计数（“我直接连接轨迹 i 和 j 有多少次？”）和传递连通性（并查集结构）。
 //
-// This class is thread-safe.
+// 该类是线程安全的。
 class ConnectedComponents {
  public:
   ConnectedComponents();
@@ -40,45 +39,41 @@ class ConnectedComponents {
   ConnectedComponents(const ConnectedComponents&) = delete;
   ConnectedComponents& operator=(const ConnectedComponents&) = delete;
 
-  // Add a trajectory which is initially connected to only itself.
+  // 添加一条初始时仅与自身连接的轨迹。
   void Add(int trajectory_id) LOCKS_EXCLUDED(lock_);
 
-  // Connect two trajectories. If either trajectory is untracked, it will be
-  // tracked. This function is invariant to the order of its arguments. Repeated
-  // calls to Connect increment the connectivity count.
+  // 连接两条轨迹。如果任一轨迹未被跟踪，它将被添加。
+  // 该函数与参数顺序无关。多次调用 Connect 会增加直接连接计数。
   void Connect(int trajectory_id_a, int trajectory_id_b) LOCKS_EXCLUDED(lock_);
 
-  // Determines if two trajectories have been (transitively) connected. If
-  // either trajectory is not being tracked, returns false, except when it is
-  // the same trajectory, where it returns true. This function is invariant to
-  // the order of its arguments.
+  // 确定两条轨迹是否已（传递地）连通。
+  // 如果任一轨迹未被跟踪则返回 false，除非是同一条轨迹则返回 true。
+  // 该函数与参数顺序无关。
   bool TransitivelyConnected(int trajectory_id_a, int trajectory_id_b)
       LOCKS_EXCLUDED(lock_);
 
-  // Return the number of _direct_ connections between 'trajectory_id_a' and
-  // 'trajectory_id_b'. If either trajectory is not being tracked, returns 0.
-  // This function is invariant to the order of its arguments.
+  // 返回轨迹 'trajectory_id_a' 和 'trajectory_id_b' 之间的“直接”连接次数。
+  // 如果任一轨迹未被跟踪则返回 0。该函数与参数顺序无关。
   int ConnectionCount(int trajectory_id_a, int trajectory_id_b)
       LOCKS_EXCLUDED(lock_);
 
-  // The trajectory IDs, grouped by connectivity.
+  // 按连通性分组的轨迹 ID 列表（每个内部 vector 代表一个连通分量）。
   std::vector<std::vector<int>> Components() LOCKS_EXCLUDED(lock_);
 
-  // The list of trajectory IDs that belong to the same connected component as
-  // 'trajectory_id'.
+  // 返回与 'trajectory_id' 属于同一连通分量的轨迹 ID 列表。
   std::vector<int> GetComponent(int trajectory_id) LOCKS_EXCLUDED(lock_);
 
  private:
-  // Find the representative and compresses the path to it.
+  // 查找代表元素（根节点）并进行路径压缩。
   int FindSet(int trajectory_id) EXCLUSIVE_LOCKS_REQUIRED(lock_);
+  // 合并两个轨迹所属的集合。
   void Union(int trajectory_id_a, int trajectory_id_b)
       EXCLUSIVE_LOCKS_REQUIRED(lock_);
 
   absl::Mutex lock_;
-  // Tracks transitive connectivity using a disjoint set forest, i.e. each
-  // entry points towards the representative for the given trajectory.
+  // 使用并查集森林跟踪传递连通性，即每个条目指向该轨迹的代表元素。
   std::map<int, int> forest_ GUARDED_BY(lock_);
-  // Tracks the number of direct connections between a pair of trajectories.
+  // 跟踪一对轨迹之间的直接连接次数。
   std::map<std::pair<int, int>, int> connection_map_ GUARDED_BY(lock_);
 };
 

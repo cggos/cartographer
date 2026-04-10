@@ -254,16 +254,36 @@ void OptimizationProblem3D::SetMaxNumIterations(
       max_num_iterations);
 }
 
+/**
+ * @brief 执行位姿图优化（Ceres 求解核心）
+ * 
+ * 该方法负责构建并求解 3D 全局 SLAM 的非线性优化问题。它融合了位姿图约束（闭环）、
+ * 惯性测量单元 (IMU) 数据、里程计、路标观测以及外部定位数据。
+ * 
+ * 核心算法逻辑：
+ * 1. 状态初始化：将子图、节点和路标的全局位姿映射为 Ceres 参数块，并处理“冻结”轨迹的固定属性。
+ * 2. 约束构建：
+ *    - SPA 约束：节点与子图间的 6-DoF 相对位姿约束。
+ *    - 惯性约束：利用 IMU 预积分数据约束连续节点间的旋转变化和线加速度。
+ *    - 辅助约束：集成里程计、局部 SLAM 连续性和固定参考帧（如 GPS）数据。
+ * 3. 优化求解：配置并调用 Ceres::Solve 进行稀疏位姿调整 (Sparse Pose Adjustment)。
+ * 4. 状态更新：将优化后的全局位姿写回 node_data_ 和 submap_data_。
+ * 
+ * @param constraints 所有已发现的位姿图约束（包括内子图和闭环约束）。
+ * @param trajectories_state 各个轨迹的当前状态（ACTIVE, FINISHED, FROZEN 等）。
+ * @param landmark_nodes 路标观测数据及其当前的全局估计。
+ */
 void OptimizationProblem3D::Solve(
     const std::vector<Constraint>& constraints,
     const std::map<int, PoseGraphInterface::TrajectoryState>&
         trajectories_state,
     const std::map<std::string, LandmarkNode>& landmark_nodes) {
   if (node_data_.empty()) {
-    // Nothing to optimize.
+    // 没有节点需要优化，直接返回
     return;
   }
 
+  // 1. 识别并记录处于冻结（FROZEN）状态的轨迹。冻结轨迹的位姿在优化中保持不变。
   std::set<int> frozen_trajectories;
   for (const auto& it : trajectories_state) {
     if (it.second == PoseGraphInterface::TrajectoryState::FROZEN) {
@@ -274,6 +294,7 @@ void OptimizationProblem3D::Solve(
   ceres::Problem::Options problem_options;
   ceres::Problem problem(problem_options);
 
+  // 定义平移参数化方式：如果配置了 fix_z_in_3d，则将 Z 轴设为常量（不优化 Z）
   const auto translation_parameterization =
       [this]() -> std::unique_ptr<ceres::LocalParameterization> {
     return options_.fix_z_in_3d()
@@ -282,19 +303,20 @@ void OptimizationProblem3D::Solve(
                : nullptr;
   };
 
-  // Set the starting point.
+  // 2. 初始化子图和节点的 Ceres 参数块 (Parameter Blocks)
   CHECK(!submap_data_.empty());
   MapById<SubmapId, CeresPose> C_submaps;
   MapById<NodeId, CeresPose> C_nodes;
   std::map<std::string, CeresPose> C_landmarks;
+
+  // 初始化所有子图的参数块
   bool first_submap = true;
   for (const auto& submap_id_data : submap_data_) {
     const bool frozen =
         frozen_trajectories.count(submap_id_data.id.trajectory_id) != 0;
     if (first_submap) {
       first_submap = false;
-      // Fix the first submap of the first trajectory except for allowing
-      // gravity alignment.
+      // 固定第一个轨迹的第一个子图，除了允许重力对齐相关的旋转外。
       C_submaps.Insert(
           submap_id_data.id,
           CeresPose(submap_id_data.data.global_pose,
@@ -312,6 +334,7 @@ void OptimizationProblem3D::Solve(
                     absl::make_unique<ceres::QuaternionParameterization>(),
                     &problem));
     }
+    // 如果属于冻结轨迹，则将该子图设为常量（不参与优化）
     if (frozen) {
       problem.SetParameterBlockConstant(
           C_submaps.at(submap_id_data.id).rotation());
@@ -319,6 +342,8 @@ void OptimizationProblem3D::Solve(
           C_submaps.at(submap_id_data.id).translation());
     }
   }
+
+  // 初始化所有节点的参数块
   for (const auto& node_id_data : node_data_) {
     const bool frozen =
         frozen_trajectories.count(node_id_data.id.trajectory_id) != 0;
@@ -327,17 +352,19 @@ void OptimizationProblem3D::Solve(
         CeresPose(node_id_data.data.global_pose, translation_parameterization(),
                   absl::make_unique<ceres::QuaternionParameterization>(),
                   &problem));
+    // 如果属于冻结轨迹，则将该节点设为常量
     if (frozen) {
       problem.SetParameterBlockConstant(C_nodes.at(node_id_data.id).rotation());
       problem.SetParameterBlockConstant(
           C_nodes.at(node_id_data.id).translation());
     }
   }
-  // Add cost functions for intra- and inter-submap constraints.
+
+  // 3. 添加位姿图约束：包括内子图约束 (Intra-submap) 和外子图/闭环约束 (Inter-submap)
   for (const Constraint& constraint : constraints) {
     problem.AddResidualBlock(
         SpaCostFunction3D::CreateAutoDiffCostFunction(constraint.pose),
-        // Loop closure constraints should have a loss function.
+        // 闭环约束通常使用 Huber Loss 以提高鲁棒性，减少误匹配带来的影响
         constraint.tag == Constraint::INTER_SUBMAP
             ? new ceres::HuberLoss(options_.huber_scale())
             : nullptr /* loss function */,
@@ -346,25 +373,28 @@ void OptimizationProblem3D::Solve(
         C_nodes.at(constraint.node_id).rotation(),
         C_nodes.at(constraint.node_id).translation());
   }
-  // Add cost functions for landmarks.
+
+  // 4. 添加路标 (Landmarks) 约束
   AddLandmarkCostFunctions(landmark_nodes, node_data_, &C_nodes, &C_landmarks,
                            &problem, options_.huber_scale());
-  // Add constraints based on IMU observations of angular velocities and
-  // linear acceleration.
+
+  // 5. 添加基于 IMU 观测（角速度和线加速度）的约束
   if (!options_.fix_z_in_3d()) {
     for (auto node_it = node_data_.begin(); node_it != node_data_.end();) {
       const int trajectory_id = node_it->id.trajectory_id;
       const auto trajectory_end = node_data_.EndOfTrajectory(trajectory_id);
       if (frozen_trajectories.count(trajectory_id) != 0) {
-        // We skip frozen trajectories.
+        // 跳过冻结轨迹
         node_it = trajectory_end;
         continue;
       }
       TrajectoryData& trajectory_data = trajectory_data_.at(trajectory_id);
 
+      // 添加 IMU 外参参数块（IMU 到 tracking frame 的旋转）
       problem.AddParameterBlock(trajectory_data.imu_calibration.data(), 4,
                                 new ceres::QuaternionParameterization());
       if (!options_.use_online_imu_extrinsics_in_3d()) {
+        // 如果不在线优化外参，则设为常量
         problem.SetParameterBlockConstant(
             trajectory_data.imu_calibration.data());
       }
@@ -387,19 +417,22 @@ void OptimizationProblem3D::Solve(
           continue;
         }
 
-        // Skip IMU data before the node.
+        // 寻找节点间对应的 IMU 数据
         while (std::next(imu_it) != imu_data.end() &&
                std::next(imu_it)->time <= first_node_data.time) {
           ++imu_it;
         }
 
         auto imu_it2 = imu_it;
+        // 集成两个节点之间的 IMU 数据（预积分）
         const IntegrateImuResult<double> result = IntegrateImu(
             imu_data, first_node_data.time, second_node_data.time, &imu_it);
         const auto next_node_it = std::next(node_it);
         const common::Time first_time = first_node_data.time;
         const common::Time second_time = second_node_data.time;
         const common::Duration first_duration = second_time - first_time;
+
+        // 如果存在连续的三个节点，可以添加加速度约束
         if (next_node_it != trajectory_end &&
             next_node_it->id.node_index == second_node_id.node_index + 1) {
           const NodeId third_node_id = next_node_it->id;
@@ -412,15 +445,14 @@ void OptimizationProblem3D::Solve(
               IntegrateImu(imu_data, first_time, first_center, &imu_it2);
           const IntegrateImuResult<double> result_center_to_center =
               IntegrateImu(imu_data, first_center, second_center, &imu_it2);
-          // 'delta_velocity' is the change in velocity from the point in time
-          // halfway between the first and second poses to halfway between
-          // second and third pose. It is computed from IMU data and still
-          // contains a delta due to gravity. The orientation of this vector is
-          // in the IMU frame at the second pose.
+          
+          // 计算速度变化量 delta_velocity
           const Eigen::Vector3d delta_velocity =
               (result.delta_rotation.inverse() *
                result_to_first_center.delta_rotation) *
               result_center_to_center.delta_velocity;
+          
+          // 添加加速度代价函数残差块
           problem.AddResidualBlock(
               AccelerationCostFunction3D::CreateAutoDiffCostFunction(
                   options_.acceleration_weight() /
@@ -436,6 +468,7 @@ void OptimizationProblem3D::Solve(
               trajectory_data.imu_calibration.data());
           gravity_block_added = true;
         }
+        // 添加旋转代价函数残差块（利用 IMU 积分得到的姿态增量）
         problem.AddResidualBlock(
             RotationCostFunction3D::CreateAutoDiffCostFunction(
                 options_.rotation_weight() / common::ToSeconds(first_duration),
@@ -446,16 +479,15 @@ void OptimizationProblem3D::Solve(
       }
 
       if (gravity_block_added) {
-        // Force gravity constant to be positive.
+        // 确保重力常数为正数
         problem.SetParameterLowerBound(&trajectory_data.gravity_constant, 0,
                                        0.0);
       }
     }
   }
 
+  // 6. 如果配置了 fix_z_in_3d，添加基于里程计和局部 SLAM 位姿的连续性约束
   if (options_.fix_z_in_3d()) {
-    // Add penalties for violating odometry (if available) and changes between
-    // consecutive nodes.
     for (auto node_it = node_data_.begin(); node_it != node_data_.end();) {
       const int trajectory_id = node_it->id.trajectory_id;
       const auto trajectory_end = node_data_.EndOfTrajectory(trajectory_id);
@@ -476,7 +508,7 @@ void OptimizationProblem3D::Solve(
           continue;
         }
 
-        // Add a relative pose constraint based on the odometry (if available).
+        // 添加基于里程计的相对位姿约束
         const std::unique_ptr<transform::Rigid3d> relative_odometry =
             CalculateOdometryBetweenNodes(trajectory_id, first_node_data,
                                           second_node_data);
@@ -491,7 +523,7 @@ void OptimizationProblem3D::Solve(
               C_nodes.at(second_node_id).translation());
         }
 
-        // Add a relative pose constraint based on consecutive local SLAM poses.
+        // 添加基于连续局部 SLAM 位姿的相对位姿约束
         const transform::Rigid3d relative_local_slam_pose =
             first_node_data.local_pose.inverse() * second_node_data.local_pose;
         problem.AddResidualBlock(
@@ -507,7 +539,7 @@ void OptimizationProblem3D::Solve(
     }
   }
 
-  // Add fixed frame pose constraints.
+  // 7. 添加固定帧 (Fixed Frame, 如 GPS) 位姿约束
   std::map<int, CeresPose> C_fixed_frames;
   for (auto node_it = node_data_.begin(); node_it != node_data_.end();) {
     const int trajectory_id = node_it->id.trajectory_id;
@@ -568,7 +600,8 @@ void OptimizationProblem3D::Solve(
           C_nodes.at(node_id).rotation(), C_nodes.at(node_id).translation());
     }
   }
-  // Solve.
+
+  // 8. 调用 Ceres Solver 执行优化
   ceres::Solver::Summary summary;
   ceres::Solve(
       common::CreateCeresSolverOptions(options_.ceres_solver_options()),
@@ -592,7 +625,7 @@ void OptimizationProblem3D::Solve(
     }
   }
 
-  // Store the result.
+  // 9. 将优化后的结果存储回内部数据结构
   for (const auto& C_submap_id_data : C_submaps) {
     submap_data_.at(C_submap_id_data.id).global_pose =
         C_submap_id_data.data.ToRigid();

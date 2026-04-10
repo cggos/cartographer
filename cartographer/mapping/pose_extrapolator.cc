@@ -241,34 +241,30 @@ Eigen::Quaterniond PoseExtrapolator::EstimateGravityOrientation(
   return imu_tracker.orientation();
 }
 
-/**
- * @brief 外推多个时间点的位姿（带重力方向）
- * 
- * 功能：批量外推一组时间点的位姿，用于运动补偿
- * 
- * @param times 时间点列表
- * @return ExtrapolationResult 包含：
- *         - previous_poses: 外推的位姿序列
- *         - current_pose: 当前位姿
- *         - current_velocity: 当前速度
- *         - gravity_from_tracking: 重力方向
- */
-PoseExtrapolator::ExtrapolationResult
-PoseExtrapolator::ExtrapolatePosesWithGravity(
-    const std::vector<common::Time>& times) {
-  // 外推除最后一个时间点之外的所有位姿
-  std::vector<transform::Rigid3f> poses;
-  for (auto it = times.begin(); it != std::prev(times.end()); ++it) {
-    poses.push_back(ExtrapolatePose(*it).cast<float>());
+void PoseExtrapolator::UpdateVelocitiesFromPoses() {
+  if (timed_pose_queue_.size() < 2) {
+    // We need two poses to estimate velocities.
+    return;
   }
-
-  // 选择速度源：有里程计用里程计速度，否则用位姿速度
-  const Eigen::Vector3d current_velocity = odometry_data_.size() < 2
-                                               ? linear_velocity_from_poses_
-                                               : linear_velocity_from_odometry_;
-  return ExtrapolationResult{poses, ExtrapolatePose(times.back()),
-                             current_velocity,
-                             EstimateGravityOrientation(times.back())};
+  CHECK(!timed_pose_queue_.empty());
+  const TimedPose& newest_timed_pose = timed_pose_queue_.back();
+  const auto newest_time = newest_timed_pose.time;
+  const TimedPose& oldest_timed_pose = timed_pose_queue_.front();
+  const auto oldest_time = oldest_timed_pose.time;
+  const double queue_delta = common::ToSeconds(newest_time - oldest_time);
+  if (queue_delta < common::ToSeconds(pose_queue_duration_)) {
+    LOG(WARNING) << "Queue too short for velocity estimation. Queue duration: "
+                 << queue_delta << " s";
+    return;
+  }
+  const transform::Rigid3d& newest_pose = newest_timed_pose.pose;
+  const transform::Rigid3d& oldest_pose = oldest_timed_pose.pose;
+  linear_velocity_from_poses_ =
+      (newest_pose.translation() - oldest_pose.translation()) / queue_delta;
+  angular_velocity_from_poses_ =
+      transform::RotationQuaternionToAngleAxisVector(
+          oldest_pose.rotation().inverse() * newest_pose.rotation()) /
+      queue_delta;
 }
 
 void PoseExtrapolator::TrimImuData() {
@@ -364,6 +360,36 @@ Eigen::Vector3d PoseExtrapolator::ExtrapolateTranslation(common::Time time) {
   }
   // 使用里程计计算的线速度（优先）
   return extrapolation_delta * linear_velocity_from_odometry_;
+}
+
+/**
+ * @brief 外推多个时间点的位姿（带重力方向）
+ *
+ * 功能：批量外推一组时间点的位姿，用于运动补偿
+ *
+ * @param times 时间点列表
+ * @return ExtrapolationResult 包含：
+ *         - previous_poses: 外推的位姿序列
+ *         - current_pose: 当前位姿
+ *         - current_velocity: 当前速度
+ *         - gravity_from_tracking: 重力方向
+ */
+PoseExtrapolator::ExtrapolationResult
+PoseExtrapolator::ExtrapolatePosesWithGravity(
+    const std::vector<common::Time>& times) {
+  // 外推除最后一个时间点之外的所有位姿
+  std::vector<transform::Rigid3f> poses;
+  for (auto it = times.begin(); it != std::prev(times.end()); ++it) {
+    poses.push_back(ExtrapolatePose(*it).cast<float>());
+  }
+
+  // 选择速度源：有里程计用里程计速度，否则用位姿速度
+  const Eigen::Vector3d current_velocity = odometry_data_.size() < 2
+                                               ? linear_velocity_from_poses_
+                                               : linear_velocity_from_odometry_;
+  return ExtrapolationResult{poses, ExtrapolatePose(times.back()),
+                             current_velocity,
+                             EstimateGravityOrientation(times.back())};
 }
 
 }  // namespace mapping

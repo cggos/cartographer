@@ -1,4 +1,39 @@
 /*
+ * PoseGraph3D - 3D位姿图实现
+ * 
+ * 功能：后端全局SLAM的核心类，负责：
+ * 1. 管理节点和子图数据
+ * 2. 构建约束（闭环检测）
+ * 3. 优化位姿图（稀疏位姿调整SPA）
+ * 
+ * 算法来源：
+ * Konolige, Kurt, et al. "Efficient sparse pose adjustment for 2d mapping."
+ * 
+ * 核心组件：
+ * - OptimizationProblem3D: 位姿图优化问题
+ * - ConstraintBuilder3D: 约束构建器（闭环检测）
+ * - PoseGraphData: 位姿图数据存储
+ * - WorkQueue: 工作队列（异步处理）
+ * 
+ * 工作流程：
+ * ┌─────────────────────────────────────────────────────────────────┐
+ * │ AddNode()  ← 前端添加节点                                      │
+ * │     ↓                                                           │
+ * │ AddWorkItem()  ← 添加工作项到队列                               │
+ * │     ↓                                                           │
+ * │ ComputeConstraintsForNode()  ← 构建约束                         │
+ * │     ├── 构建内子图约束（INTRA_SUBMAP）                          │
+ * │     └── 构建外子图约束（INTER_SUBMAP，闭环检测）                │
+ * │     ↓                                                           │
+ * │ ConstraintBuilder3D::WhenDone()  ← 约束构建完成回调            │
+ * │     ↓                                                           │
+ * │ HandleWorkQueue()  ← 处理工作队列                               │
+ * │     ↓                                                           │
+ * │ RunOptimization()  ← 运行Ceres优化                             │
+ * │     ↓                                                           │
+ * │ 更新全局位姿                                                   │
+ * └─────────────────────────────────────────────────────────────────┘
+ * 
  * Copyright 2016 The Cartographer Authors
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
